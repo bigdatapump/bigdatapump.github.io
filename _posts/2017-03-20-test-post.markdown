@@ -1,0 +1,132 @@
+---
+layout: post
+title: "Appending AWS S3 files to Azure Blob"
+date: 2017-03-20
+categories:
+---
+
+This tutorial is focussed on the following scenario. Assume we have JSON objects stored in filed named `folder1/YYYY-MM-DD` in an S3 bucket. The files themselves are not very large (around a few MB), but over the course of a few months the amount of data can grow to be quite considerable. In fact, if we have several folders, `folder1/YYYY-MM-DD ... folderN/YYYY-MM-DD`, the amount of data may be too large to fit into memory, which calls for use of big data tools. Here, we will use Azure HDInsight to analyse the data, which would need to be transferred into Azure Blob Storage from S3
+
+When we enter the Hadoop space in this problem setting, the so-called [Small Files Problem](https://blog.cloudera.com/blog/2009/02/the-small-files-problem/). In a nutshell, HDFS is not geared up to efficiently accessing small files: it is primarily designed for streaming access of large files. Therefore, we aim to create a single, large file in Azure by attaching some identifying information to each S3 object and appending it to a file in Azure. 
+
+This process consists of the following steps:
+
+1. Create empty append blob in Azure
+2. List all files in the bucket
+3. Download a file and modify the object by attaching a folder name and date property to the JSON object. 
+4. Append the JSON object to the file in Azure Blob Storage, taking care to delimit objects with a newline character
+
+The python code to acheive this is given below
+
+## Create an empty append blob in Azure
+
+
+```python
+%load_ext autoreload
+%autoreload 2
+
+from azure.storage.blob import AppendBlobService
+import config # This file contains config variables like account names and keys
+
+append_blob = AppendBlobService(account_key=config.az_storage_account_key,account_name=config.az_storage_account_name)
+
+# Create container [optional]
+append_blob.create_container('housing')
+
+# Append blobs must be created before they are appended to
+append_blob.create_blob('housing', 'data.json')
+
+```
+
+## List files in S3 bucket
+
+
+```python
+from boto.s3.connection import S3Connection
+import config
+conn = S3Connection(config.aws_access_key,config.aws_secret)
+
+bucket = conn.get_bucket('housing-hel')
+
+# List of files
+keys = [key.name for key in bucket.list() if not key.name.endswith('/')]
+
+```
+
+## A pause for some data management
+
+When working with large amounts of data it is imperative to have processes in place to manage the flow of data, and this includes documenting what went where and when. if at some point we wish to clear some space in our S3 account, it would be a good idea to know what has already been written to Blob Storage. Moreover, when we run out script again, we do not want to create duplicates in the unified data file. With this mind, whenever we create a record in the masrter data `data.json`, we update a metadata file with the name of the object we just wrote to Blob Storage. We will name this file 'metadata' and we will write a JSON object
+
+```json
+{
+    "timestamp": "YYYY-MM-DD HH:MM:SS",
+    "key": "foldern/YYYY-MM-DD"
+}
+```
+We choose JSON over CSV simply because we may need to modify the schema over time, and this is not possible with a CSV. 
+
+
+```python
+append_blob.create_blob('housing','metadata')
+```
+
+## Modify object and upload. Update metadata
+
+
+```python
+import json
+from datetime import datetime
+
+for key in keys:
+    # Download and modify data oject 
+    obj = json.loads(bucket.get_key(key).get_contents_as_string())
+    obj['type'] = key.split('/')[0]
+    obj['date'] = key.split('/')[1]
+    
+    # Create metadata
+    metadata_obj = {'timestamp':datetime.now().strftime('%Y-%m-%d %H:%M:%S'),'key': key}
+    
+    # Write to Blob storage
+    append_blob.append_blob_from_text('housing','metadata',json.dumps(metadata_obj)+'\n')
+    append_blob.append_blob_from_text('housing','data.json',json.dumps(obj)+'\n')
+    
+    print('{} written!'.format(key))
+    
+    
+```
+
+The above solution works the first time, but when we run it again, we don't want to duplicate anything. We will now modify the above python code to skip keys that already exists in the metadata
+
+
+```python
+metadata = append_blob.get_blob_to_text('housing','metadata').content.strip().split('\n')
+
+try:
+    existing_keys = json.loads('{"foo":"bar"}')
+except json.JSONDecodeError:
+    existing_keys = []
+
+for key in keys:
+    if key not in existing_keys:
+        # Download and modify data oject 
+        obj = json.loads(bucket.get_key(key).get_contents_as_string())
+        obj['type'] = key.split('/')[0]
+        obj['date'] = key.split('/')[1]
+    
+        # Create metadata
+        metadata_obj = {'timestamp':datetime.now().strftime('%Y-%m-%d %H:%M:%S'),'key': key}
+
+        # Write to Blob storage
+        append_blob.append_blob_from_text('housing','metadata',json.dumps(metadata_obj)+'\n')
+        append_blob.append_blob_from_text('housing','data.json',json.dumps(obj)+'\n')
+    
+        print('{} written!'.format(key))
+        
+    else:
+        print('Key was already written. Skipping...')
+    
+```
+
+## Conclusion
+
+We now have a way to build a large data set suitable for use with HDFS. The same idea can be used with CSV files as well with some minor modifications. 
